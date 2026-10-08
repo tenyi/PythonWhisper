@@ -23,7 +23,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
@@ -102,7 +102,12 @@ def load_audio_mono_16k(path: str) -> np.ndarray:
             # - 's32' / 's32p'：int32，需除以 2147483648.0
             fmt_name = frame.format.name
             arr = frame.to_ndarray()  # shape: (channels, samples) 或 (samples,)
-            if arr.ndim == 2 and arr.shape[0] > 1:
+            n_ch = len(frame.layout.channels)
+            if not frame.format.is_planar and n_ch > 1:
+                # 交錯式（packed，如 WAV 的 s16）多聲道：shape 為 (1, samples*channels)，
+                # 需先還原成 (samples, channels) 再平均，否則長度會變成 channels 倍
+                arr = arr.reshape(-1, n_ch).mean(axis=1)
+            elif arr.ndim == 2 and arr.shape[0] > 1:
                 arr = arr.mean(axis=0)
             else:
                 arr = arr.flatten()
@@ -178,6 +183,9 @@ class VadProcessor:
             min_silence_duration_ms=self.min_silence_ms,
             speech_pad_ms=self.speech_pad_ms,
             threshold=self.threshold,
+            # 長語音段在 30s 內的靜音點自然切開，避免後續硬切 30s 把詞切斷而重複/漏字；
+            # 預留 1s 給前後 speech_pad，確保 region 長度 ≤ CHUNK_LENGTH_S
+            max_speech_duration_s=CHUNK_LENGTH_S - 1,
             return_seconds=True,
         )
         return [(t["start"], t["end"]) for t in timestamps]
@@ -211,10 +219,16 @@ class BreezeASREngine:
             f"device={self.device.type}, dtype={self.dtype}"
         )
         self.processor = AutoProcessor.from_pretrained(self.model_path)
+        # alignment 模式需要 cross_attentions，sdpa 不支援 output_attentions，
+        # 必須改用 eager；其他模式維持預設（sdpa 較快）
+        extra = {}
+        if os.environ.get("BREEZE_SEGMENT_MODE", "chars").lower() == "alignment":
+            extra["attn_implementation"] = "eager"
         self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
             self.model_path,
             dtype=self.dtype,
             low_cpu_mem_usage=True,
+            **extra,
         ).to(self.device)
         self.model.eval()
         if self.use_vad:
@@ -421,7 +435,14 @@ class BreezeASREngine:
                     current_tokens = []
 
             tok_len = len(tok.strip())
-            if tok_len > 0 and cur_len() + tok_len > max_chars and cur_len() >= min_chars:
+            # 標點符號一律黏在前段結尾，避免新段落以標點開頭
+            is_punct = tok.strip() in punct_set
+            if (
+                tok_len > 0
+                and not is_punct
+                and cur_len() + tok_len > max_chars
+                and cur_len() >= min_chars
+            ):
                 raw_segments.append("".join(current_tokens).strip())
                 current_tokens = []
 
@@ -532,27 +553,31 @@ class BreezeASREngine:
         if not text_indices:
             return []
 
-        text_tokens = [
-            self.processor.tokenizer.decode([pred_ids[i].item()], skip_special_tokens=True)
-            for i in text_indices
-        ]
+        # 注意：Whisper 為 byte-level BPE，一個中文字常橫跨多個 token，
+        # 單獨 decode 會得到 "�"，因此累積 token id、整段一起 decode
+        tokenizer = self.processor.tokenizer
+        text_ids = [pred_ids[i].item() for i in text_indices]
         token_times_list = [
             max(offset, min(offset + chunk_duration, token_times[i].item()))
             for i in text_indices
         ]
 
+        def decode_ids(ids: List[int]) -> str:
+            return tokenizer.decode(ids, skip_special_tokens=True)
+
         # 依時間間隔與長度將 token 組織為 Segment
         gap_threshold = float(os.environ.get("BREEZE_ALIGN_GAP_MS", "500")) / 1000.0
         aligned_segments: List[Segment] = []
-        cur_tokens: List[str] = []
+        cur_ids: List[int] = []
         cur_start = token_times_list[0]
         cur_end = token_times_list[0]
 
-        for tok, t_time in zip(text_tokens, token_times_list):
-            if not tok:
-                continue
-            if cur_tokens and (t_time - cur_end > gap_threshold or len("".join(cur_tokens)) >= 15):
-                txt = "".join(cur_tokens).strip()
+        for tok_id, t_time in zip(text_ids, token_times_list):
+            cur_txt = decode_ids(cur_ids) if cur_ids else ""
+            # 目前累積文字尾端若是不完整的多位元組字元，不可在此切段
+            can_split = bool(cur_txt) and not cur_txt.endswith("�")
+            if can_split and (t_time - cur_end > gap_threshold or len(cur_txt) >= 15):
+                txt = cur_txt.strip()
                 if txt:
                     aligned_segments.append(
                         Segment(
@@ -561,15 +586,15 @@ class BreezeASREngine:
                             text=txt,
                         )
                     )
-                cur_tokens = [tok]
+                cur_ids = [tok_id]
                 cur_start = t_time
                 cur_end = t_time
             else:
-                cur_tokens.append(tok)
+                cur_ids.append(tok_id)
                 cur_end = max(cur_end, t_time)
 
-        if cur_tokens:
-            txt = "".join(cur_tokens).strip()
+        if cur_ids:
+            txt = decode_ids(cur_ids).strip()
             if txt:
                 aligned_segments.append(
                     Segment(
@@ -684,7 +709,8 @@ class Transcribe(BaseModel):
     srt: str = ""
     vtt: str = ""
     translation: str = ""
-    guid: str = str(uuid.uuid4())
+    # 每個實例產生新的 uuid（直接寫預設值會在類別定義時只算一次，所有結果共用同一個 guid）
+    guid: str = Field(default_factory=lambda: str(uuid.uuid4()))
     duration: float = 0.0
     whisper_api_cost: float = 0.0
 
@@ -860,12 +886,14 @@ def transcribe_file(audio_file: str) -> Tuple[List[Segment], TranscriptionInfo]:
             "transcribe_file", audio_file=audio_file, file_size=file_size
         ):
             initialize_model()
-            if asr_engine is None:
+            # 先取本地參考，避免檢查後被其他執行緒 release_model() 設成 None
+            engine = asr_engine
+            if engine is None:
                 raise ModelError(
                     message="模型未正確初始化",
                     error_code=ErrorCode.MODEL_NOT_INITIALIZED,
                 )
-            segments, info = asr_engine.transcribe(audio_file)
+            segments, info = engine.transcribe(audio_file)
             logger.info(f"轉錄完成，共 {len(segments)} 個片段")
             return segments, info
     except (FileError, TranscriptionError, ModelError):
