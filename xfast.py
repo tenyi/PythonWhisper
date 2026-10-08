@@ -12,6 +12,7 @@ initialize_model / release_model / write_*）與原本 OpenAI-Whisper 版本
 保持相容，xflask-whisper.py 無需更動。
 """
 import gc
+import math
 import os
 import re
 import sys
@@ -65,7 +66,6 @@ DEFAULT_MODEL_PATH = os.environ.get(
 MODEL_ID = "MediaTek-Research/Breeze-ASR-26 (Whisper-large-v2 為基礎的台語 ASR)"
 TARGET_SR = 16000  # Whisper 要求 16 kHz
 CHUNK_LENGTH_S = 30  # Whisper 單次最大輸入長度
-MAX_NEW_TOKENS = 440  # < max_target_positions (448)
 
 # 全域 ASR 引擎與鎖
 asr_engine: Optional["BreezeASREngine"] = None
@@ -327,7 +327,7 @@ class BreezeASREngine:
 
         1. "chars"（預設）：按字元數切段，時間均分
            - 適合：無法做 cross-attention alignment 的模型（如 Breeze-ASR-26）
-           - 環境變數：BREEZE_SEGMENT_CHARS=10（每段最大字數）
+           - 環境變數：BREEZE_SEGMENT_CHARS=16（每段目標顯示寬度，參考 Netflix 規範）
 
         2. "alignment"：用 cross-attention 找 token 對齊（需 Breeze 是
            Whisper 系且有時間戳記能力；目前 Breeze 沒學到對齊，會 fallback
@@ -348,7 +348,6 @@ class BreezeASREngine:
         with torch.no_grad():
             pred_ids = self.model.generate(
                 input_features,
-                max_new_tokens=MAX_NEW_TOKENS,
                 language=language,
                 task="transcribe",
             )
@@ -383,7 +382,7 @@ class BreezeASREngine:
                 # 繼續用 chars 模式
 
         # 預設 chars 模式：按字元切段
-        max_chars = int(os.environ.get("BREEZE_SEGMENT_CHARS", "10"))
+        max_chars = int(os.environ.get("BREEZE_SEGMENT_CHARS", "16"))
         min_chars = int(os.environ.get("BREEZE_SEGMENT_MIN_CHARS", "4"))
         return self._split_text_by_chars(
             text_out, offset, chunk_duration, max_chars, min_chars
@@ -394,70 +393,104 @@ class BreezeASREngine:
         text: str,
         offset: float,
         chunk_duration: float,
-        max_chars: int = 10,
+        max_chars: int = 16,
         min_chars: int = 4,
     ) -> List[Segment]:
-        """按字元數切段，時間均分。
+        """按詞組切段，時間依顯示寬度比例分配。
 
         規則：
-        - 支援中文與台語漢字無空白連續文字切段
-        - 英文與羅馬拼音按單詞切段並保留原空白
-        - 標點符號優先作為自然斷句點
-        - 切完每段字元數 <= max_chars（單詞超過者獨立成段）
-        - 最後一段可短於 min_chars（保留尾部）
+        - 以空白與標點作為詞組邊界（Breeze 輸出的詞組間本來就有空白），
+          只在詞組之間斷句，避免把「微調」切成「微 | 調」
+        - 長度以「顯示寬度」計算：全形（中文）= 1，半形（英數）= 0.5，
+          參考 Netflix 字幕規範（繁中每行 16 字 ≈ 英文每行 42 字元）
+        - 多個詞組合併成一段，每段寬度（不含空白）<= max_chars（預設 16，一行）
+        - 標點結尾且已達 min_chars 時優先斷句
+        - 單一詞組超過 max_chars 的 2 倍（預設 32，兩行）才退回等長硬切；
+          純英文單字不切
         """
         if not text or not text.strip():
             return []
 
-        # Tokenize：區分 CJK 單字元、一般文字+空格、空白符
-        pattern = (
-            r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3000-\u303f\uff00-\uffef]'
-            r'|[^\s\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3000-\u303f\uff00-\uffef]+(?:\s*)'
-            r'|\s+'
-        )
-        tokens = re.findall(pattern, text)
-        if not tokens:
+        punct_set = set("，。！？、；：,!?.…")
+
+        def width(s: str) -> float:
+            """顯示寬度：半形 ASCII 算 0.5，其餘（中文、全形）算 1。"""
+            return sum(0.5 if c.isascii() else 1.0 for c in s)
+
+        # 1. 拆詞組：先依空白切，再於標點後切開（標點黏在前一個詞組結尾）
+        #    每個詞組記錄原文中它前面是否有空白，合併時照原樣還原
+        phrases: List[Tuple[str, str]] = []  # (詞組, 前置分隔字元 " " 或 "")
+        for word in text.split():
+            sep = " "
+            for part in re.findall(r"[^，。！？、；：,!?…]+[，。！？、；：,!?…]*|[，。！？、；：,!?…]+", word):
+                if phrases and all(c in punct_set for c in part):
+                    # 純標點黏到前一個詞組
+                    phrases[-1] = (phrases[-1][0] + part, phrases[-1][1])
+                else:
+                    phrases.append((part, sep))
+                sep = ""  # 同一個空白詞內的後續詞組，原文無空白
+        if not phrases:
             return []
 
-        punct_set = set("，。！？、；：,!?.…")
-        raw_segments: List[str] = []
-        current_tokens: List[str] = []
-
-        def cur_len() -> int:
-            return len("".join(current_tokens).strip())
-
-        for tok in tokens:
-            # 若前一個 token 結尾為標點符號，且已達最短長度，優先切段
-            if current_tokens and cur_len() >= min_chars:
-                last_char = "".join(current_tokens).rstrip()[-1:]
-                if last_char in punct_set:
-                    raw_segments.append("".join(current_tokens).strip())
-                    current_tokens = []
-
-            tok_len = len(tok.strip())
-            # 標點符號一律黏在前段結尾，避免新段落以標點開頭
-            is_punct = tok.strip() in punct_set
+        # 1.5 連續英文單字（如 "GPT-4 Mini"）合計寬度 <= max_chars 時併成一個詞組，
+        #     避免斷在英文單字之間；前一詞以標點結尾則不併（保留標點斷句）。
+        #     超過 max_chars 的整句英文維持逐字，交由步驟 3 正常合併
+        grouped: List[Tuple[str, str]] = []
+        for ph, sep in phrases:
             if (
-                tok_len > 0
-                and not is_punct
-                and cur_len() + tok_len > max_chars
-                and cur_len() >= min_chars
+                grouped
+                and sep == " "
+                and ph.isascii()
+                and grouped[-1][0].isascii()
+                and grouped[-1][0][-1] not in punct_set
+                and width(grouped[-1][0].replace(" ", "")) + width(ph) <= max_chars
             ):
-                raw_segments.append("".join(current_tokens).strip())
-                current_tokens = []
+                grouped[-1] = (grouped[-1][0] + " " + ph, grouped[-1][1])
+            else:
+                grouped.append((ph, sep))
+        phrases = grouped
 
-            current_tokens.append(tok)
+        # 2. 超長詞組處理：
+        #    - 不超過 max_chars 的 2 倍（預設寬度 32，兩行）→ 整段保留（寧可字幕稍長，也不切斷詞）
+        #    - 純英文/數字的單字（如 URL、長英文字）一律不切，避免切斷單字
+        #    - 更長的中文才逐字切成「等長」片段，避免留下 1~2 字的短尾巴
+        overflow_limit = max_chars * 2
+        pieces: List[Tuple[str, str]] = []
+        for ph, sep in phrases:
+            if width(ph) <= overflow_limit or ph.isascii():
+                pieces.append((ph, sep))
+                continue
+            n_cuts = math.ceil(width(ph) / max_chars)
+            size = -(-len(ph) // n_cuts)
+            cuts = [ph[i : i + size] for i in range(0, len(ph), size)]
+            if len(cuts) > 1 and all(c in punct_set for c in cuts[-1]):
+                cuts[-2] += cuts.pop()
+            pieces.append((cuts[0], sep))
+            pieces.extend((c, "") for c in cuts[1:])
 
-        if current_tokens:
-            txt = "".join(current_tokens).strip()
-            if txt:
-                raw_segments.append(txt)
+        # 3. 貪婪合併詞組成段；段內詞組依原文分隔字元接回
+        raw_segments: List[str] = []
+        current = ""
+        cur_len = 0.0  # 目前段落顯示寬度（不含空白）
+        for pc, sep in pieces:
+            if current and cur_len + width(pc.replace(" ", "")) > max_chars:
+                raw_segments.append(current)
+                current, cur_len = "", 0
+            current = current + sep + pc if current else pc
+            cur_len += width(pc.replace(" ", ""))
+            # 標點結尾且夠長 → 在此自然斷句
+            if cur_len >= min_chars and pc[-1] in punct_set:
+                raw_segments.append(current)
+                current, cur_len = "", 0
+        if current:
+            raw_segments.append(current)
 
         if not raw_segments:
             return []
 
-        # 計算每段時間（按字元比例）
-        total_chars = sum(len(s) for s in raw_segments)
+        # 計算每段時間（按顯示寬度比例，不含空白；英文字母算半寬，避免長英文字分到過多時間）
+        seg_widths = [width(s.replace(" ", "")) for s in raw_segments]
+        total_chars = sum(seg_widths)
         if total_chars == 0:
             return []
 
@@ -465,7 +498,7 @@ class BreezeASREngine:
         cursor = offset
         end_boundary = offset + chunk_duration
         for i, txt in enumerate(raw_segments):
-            portion = len(txt) / total_chars
+            portion = seg_widths[i] / total_chars
             seg_dur = chunk_duration * portion
             seg_start = cursor
             seg_end = seg_start + seg_dur
@@ -502,7 +535,6 @@ class BreezeASREngine:
             with torch.no_grad():
                 pred_ids = self.model.generate(
                     input_features,
-                    max_new_tokens=MAX_NEW_TOKENS,
                     language=language,
                     task="transcribe",
                 )[0]

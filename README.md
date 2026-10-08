@@ -23,6 +23,7 @@
   - [VAD (VadProcessor)](#vad-vadprocessor)
   - [ASR 引擎 (BreezeASREngine)](#asr-引擎-breezeeasrengine)
   - [時間戳記推算](#時間戳記推算)
+  - [字幕切段規則（Netflix 規範）](#字幕切段規則netflix-規範)
   - [錯誤處理與資源管理](#錯誤處理與資源管理)
 - [輸出格式](#輸出格式)
 - [檔案結構](#檔案結構)
@@ -546,6 +547,9 @@ curl -X POST -H "Content-Type: application/json" \
 | `VAD_MIN_SPEECH_MS` | `250` | 短於此毫秒數的語音段會被丟棄（避免噪音觸發） |
 | `VAD_MIN_SILENCE_MS` | `500` | 長於此毫秒數的靜音會切句 |
 | `VAD_SPEECH_PAD_MS` | `100` | 語音段兩端的 padding（避免切到字首字尾） |
+| `BREEZE_SEGMENT_MODE` | `chars` | 字幕切段模式：`chars`（依詞組與寬度切段）、`alignment`（實驗性 cross-attention 對齊）、`off`（每個 chunk 一段） |
+| `BREEZE_SEGMENT_CHARS` | `16` | 每段字幕目標顯示寬度（中文 1、英數 0.5），參考 Netflix 繁中每行 16 字；無空白長詞組上限為其 2 倍 |
+| `BREEZE_SEGMENT_MIN_CHARS` | `4` | 遇到標點時，段落至少達此寬度才斷句 |
 
 > 💡 所有環境變數在 `initialize_model()` 呼叫時讀取；修改後需重啟服務。
 
@@ -775,21 +779,63 @@ Breeze 不產生時間戳，所以我們用**幾何推算**：
 | --- | --- |
 | VAD 語音段起點 | `VadProcessor.get_speech_timestamps(return_seconds=True)` 直接給秒數 |
 | Sub-chunk 起點 | `region_start + sub_chunk_index * 30` |
-| Sub-chunk 內部句子 | `chunk_duration * (part_chars / total_chars)` 字元比例分配 |
+| Sub-chunk 內部句子 | `chunk_duration * (段落寬度 / 總寬度)` 依顯示寬度比例分配（不含空白） |
+
+VAD 會以 `max_speech_duration_s=29` 在靜音點自動切開長語音段，
+因此每個語音段都 ≤ 30s，不會在句子中間硬切 30s 造成重複或漏字。
 
 **例子**：test.ogg (94.34s)
-- VAD 偵測 4 段：第一段 1.10-49.70，其他 3 段都 ≤ 30s
-- 第一段切成兩個 30s sub-chunk：
-  - sub-chunk 1: offset=1.10, duration=30.0 → `[1.10, 31.10]`
-  - sub-chunk 2: offset=31.10, duration=18.60 → `[31.10, 49.70]`
-- 第二段整段一個 chunk: offset=50.50, duration=24.0 → `[50.50, 74.50]`
+- VAD 偵測 6 段，最長 24.0s，全部 ≤ 30s
+- 第一段 `[1.10, 18.00]` 為一個 chunk：offset=1.10, duration=16.90
+- 第二段 `[18.20, 37.00]` 為一個 chunk：offset=18.20, duration=18.80
 - ...
 
 **已知精度限制**：
 
 - VAD 邊界本身有 ±100ms 誤差（受 `speech_pad_ms` 影響）
-- 句子內部時間均分，**不是字級（word-level）對齊**
-- 標點切句若模型輸出沒標點（像 Breeze），整個 chunk 就是 1 個 segment
+- 句子內部時間依寬度比例估算，**不是字級（word-level）對齊**
+
+---
+
+### 字幕切段規則（Netflix 規範）
+
+`chars` 模式下，每個 chunk 的辨識文字會依下列規則切成多段字幕
+（`BreezeASREngine._split_text_by_chars`）。數值參考
+[Netflix 字幕規範](https://partnerhelp.netflixstudios.com/hc/en-us/articles/215986007)：
+
+| 規範項目 | 繁體中文 | 英文 |
+| --- | --- | --- |
+| 每行最多 | 16 字 | 42 字元 |
+| 每段最多 | 2 行 | 2 行 |
+| 閱讀速度 | 約 9 字／秒 | 約 17–20 字元／秒 |
+
+**顯示寬度**：中文、全形字元算 1，半形英數字元算 0.5。
+42 個英文字元 ≈ 21 寬，與中文每行 16 字相近，中英混排時長度一致。
+
+**切段規則**：
+
+1. **只在詞組邊界斷句**：Breeze 輸出**沒有標點**，但詞組之間有空白，
+   因此以空白（以及有標點時的標點）作為斷句點，不會把「微調」切成「微｜調」。
+2. **合併成一行**：相鄰詞組合併，每段寬度 ≤ 16（`BREEZE_SEGMENT_CHARS`，一行字幕）。
+3. **長詞組容忍兩行**：中間沒有空白的長詞組，寬度 ≤ 32（兩行）時整段保留；
+   超過才**平均**切成等長片段，避免留下 1–2 字的短尾巴。
+4. **英文單字不切**：純英數詞組（長單字、URL）一律完整保留，可能超過 32。
+   連續英文單字（如 `GPT-4 Mini`）合計寬度 ≤ 16 時視為一個詞組，不會從中間斷開；
+   更長的整句英文則逐字合併。
+5. **標點優先**：若輸出有標點（如原版 Whisper），標點一律黏在前段結尾，
+   且段落寬度 ≥ 4（`BREEZE_SEGMENT_MIN_CHARS`）時在標點處斷句。
+
+**範例**（test.ogg）：
+
+| 開始 | 結束 | 文字 |
+| --- | --- | --- |
+| 00:00:01.100 | 00:00:04.503 | 那很多時候 我們想要修改基礎模型 |
+| 00:00:04.503 | 00:00:07.452 | 往往只想要改它的一個小地方 |
+| 00:00:07.452 | 00:00:08.359 | 舉例來說 |
+| 00:00:08.359 | 00:00:11.308 | 剛才說問誰是全世界最帥的人 |
+| 00:00:11.308 | 00:00:13.917 | GPT-4 Mini 它不直接回答你 |
+
+> 若想要更短的字幕（例如手機直式畫面），可設 `BREEZE_SEGMENT_CHARS=12`。
 
 ---
 
