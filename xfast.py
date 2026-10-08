@@ -32,7 +32,6 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 from common import (
     Segment,
     TranscriptionInfo,
-    opencc_manager,
     safe_execute,
     handle_errors,
     log_error,
@@ -50,7 +49,7 @@ from exceptions import (
     create_transcription_error,
 )
 from logging_config import get_logger
-from translator_ollama import summary_text_ollama, translate_text_ollama
+from translator_ollama import punctuate_text, summary_text_ollama
 
 # 抑制 transformers 內部的 torchcodec 噪音警告（FFmpeg 版本衝突時會一直輸出）
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
@@ -769,14 +768,10 @@ def format_time_srt(seconds_val: float) -> str:
 def write_transcript(segments_list, info, filename):
     try:
         with error_context("write_transcript", filename=filename):
+            # 不做 OpenCC 簡繁轉換：Breeze 本身輸出繁體，再套 s2twp 會誤轉（如「只要」→「隻要」）
             with open(filename, "w", encoding="utf-8") as f:
-                cc = None
-                if info.language == "zh":
-                    cc = opencc_manager.get_cc("s2twp.json")
                 for segment in segments_list:
                     text = segment.text
-                    if cc is not None:
-                        text = cc.convert(text)
                     f.write(
                         "[%s --> %s]\n %s\n\n"
                         % (
@@ -800,21 +795,18 @@ def write_transcript(segments_list, info, filename):
 def write_translation(segments_list, info, filename):
     try:
         with error_context("write_translation", filename=filename):
+            # 原本為「中翻中」翻譯，LLM 會改寫內容；改為補標點＋修正同音錯字（punctuate_text）。
+            # 不再做 OpenCC 轉換：punctuate_text 已對 LLM 輸出做過繁體轉換，重複轉換會誤轉
             with open(filename, "w", encoding="utf-8") as f:
-                cc = None
-                if info.language == "zh":
-                    cc = opencc_manager.get_cc("s2twp.json")
                 for segment in segments_list:
                     text = segment.text
                     if not text.strip():
                         continue
                     translated = safe_execute(
-                        translate_text_ollama,
+                        punctuate_text,
                         text,
                         fallback_value=text,
                     )
-                    if cc is not None and translated:
-                        translated = cc.convert(translated)
                     f.write(
                         "[%s --> %s]\n %s\n\n"
                         % (

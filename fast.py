@@ -7,7 +7,7 @@ from opencc import OpenCC  # 匯入 opencc 用於簡繁轉換
 from pydantic import BaseModel
 import sys  # 匯入 sys 模組，用於處理命令列參數
 from typing import List, Any  # 匯入類型提示
-from translator_ollama import translate_text_ollama, summary_text_ollama
+from translator_ollama import translate_text_ollama, summary_text_ollama, fix_s2twp
 import uuid
 import gc
 import threading
@@ -231,7 +231,7 @@ def write_transcript(
                 for segment in segments_list:  # 迭代處理每個語音片段
                     segment_text: str = segment.text
                     if cc is not None:  # 如果需要轉換繁體中文
-                        segment_text = cc.convert(segment.text)
+                        segment_text = fix_s2twp(cc.convert(segment.text))  # 修正 s2twp 誤轉（如「只要」→「隻要」）
                     # 將格式化後的時間戳記和文字寫入檔案
                     f.write(
                         "[%s --> %s]\n %s\n\n"  # 時間戳記格式，並空一行
@@ -296,7 +296,7 @@ def write_translation(
                     
                     # 如果需要轉換繁體中文
                     if cc is not None:
-                        translated_text = cc.convert(translated_text)
+                        translated_text = fix_s2twp(cc.convert(translated_text))  # 修正 s2twp 誤轉（如「只要」→「隻要」）
                     
                     # 將格式化後的時間戳記和文字寫入檔案
                     f.write(

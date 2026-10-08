@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 import requests
 import re
@@ -15,6 +16,42 @@ from http_client import HTTPClient
 from logging_config import get_logger
 
 logger = get_logger("translator")
+
+# s2twp 對「已是繁體」的文字會誤轉部分詞彙（「只」為簡繁一對多），轉換後硬性修正回來
+S2TWP_FIXES = {
+    "隻要": "只要",
+}
+
+
+def fix_s2twp(text: str) -> str:
+    """修正 OpenCC s2twp 的已知誤轉（例：「只要」被轉成「隻要」）。"""
+    for wrong, right in S2TWP_FIXES.items():
+        text = text.replace(wrong, right)
+    return text
+
+
+# LLM 服務設定：OpenAI 相容 API（vLLM），可用環境變數覆寫
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://10.10.15.15:8000")
+LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemma-4-26B-A4B-it")
+
+
+def _chat(url: str, data: dict) -> Optional[str]:
+    """呼叫 OpenAI 相容的 /v1/chat/completions，回傳回覆文字；格式不符時回傳 None。
+
+    url 可為服務根網址，或舊版 Ollama 的完整網址（如 http://host:11434/api/chat），
+    會自動去掉已知的路徑後綴；Ollama 本身也支援 /v1/chat/completions，故舊網址仍可用。
+    """
+    base = url.rstrip("/")
+    for suffix in ("/api/chat", "/v1/chat/completions", "/v1"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    json_data = HTTPClient(base).post("/v1/chat/completions", data)
+    try:
+        return json_data["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
+        logger.error(f"LLM API 回應格式錯誤: {json_data}")
+        return None
 
 
 @handle_file_operations
@@ -93,13 +130,13 @@ def translate_subtitle_file(input_file, output_file) -> None:
 
 
 @retry_on_exception(max_retries=3, delay=1.0, exceptions=(APIError,))
-def summary_text_ollama(text: str, url: str = "http://localhost:11434/api/chat", model: str = "gemma3:27b") -> str:
+def summary_text_ollama(text: str, url: str = LLM_BASE_URL, model: str = LLM_MODEL) -> str:
     """
     總結會議摘要
 
     Args:
         text: 要總結的文字
-        url: Ollama API URL
+        url: LLM 服務網址（OpenAI 相容 API）
         model: 使用的模型名稱
 
     Returns:
@@ -122,8 +159,6 @@ def summary_text_ollama(text: str, url: str = "http://localhost:11434/api/chat",
 
     try:
         with error_context("summary_generation", text_length=len(text), model=model):
-            client = HTTPClient(url.rsplit('/api/chat', 1)[0])
-
             data = {
                 "model": model,
                 "messages": [
@@ -162,17 +197,16 @@ def summary_text_ollama(text: str, url: str = "http://localhost:11434/api/chat",
             }
 
             # 發送 POST 請求以獲取總結
-            json_data = client.post("/api/chat", data)
+            content = _chat(url, data)
 
             # 檢查回應格式
-            if "message" not in json_data or "content" not in json_data["message"]:
+            if content is None:
                 raise SummaryError(
                     message="API 回應格式錯誤",
                     error_code=ErrorCode.API_RESPONSE_ERROR,
-                    details={"response": json_data}
                 )
 
-            summary = json_data["message"]["content"].strip()
+            summary = content.strip()
 
             # 移除思考標籤
             summary = re.sub(r'<think>.*?</think>', '', summary, flags=re.DOTALL)
@@ -181,13 +215,13 @@ def summary_text_ollama(text: str, url: str = "http://localhost:11434/api/chat",
                 raise SummaryError(
                     message="API 回傳空摘要",
                     error_code=ErrorCode.SUMMARY_ERROR,
-                    details={"original_response": json_data["message"]["content"]}
+                    details={"original_response": content}
                 )
 
             # 轉換為繁體中文
             try:
                 cc = OpenCC("s2twp")
-                summary = cc.convert(summary)
+                summary = fix_s2twp(cc.convert(summary))
             except Exception as e:
                 logger.warning(f"繁體中文轉換失敗: {str(e)}")
                 # 轉換失敗不影響主要功能，繼續執行
@@ -207,13 +241,13 @@ def summary_text_ollama(text: str, url: str = "http://localhost:11434/api/chat",
 
 
 @retry_on_exception(max_retries=3, delay=1.0, exceptions=(APIError,))
-def correct_words_ollama(text: str, url: str = "http://localhost:11434/api/chat", model: str = "gemma3:27b") -> str:
+def correct_words_ollama(text: str, url: str = LLM_BASE_URL, model: str = LLM_MODEL) -> str:
     """
     修正錯字
 
     Args:
         text: 要修正的文字
-        url: Ollama API URL
+        url: LLM 服務網址（OpenAI 相容 API）
         model: 使用的模型名稱
 
     Returns:
@@ -228,8 +262,6 @@ def correct_words_ollama(text: str, url: str = "http://localhost:11434/api/chat"
 
     try:
         with error_context("text_correction", text_length=len(text), model=model):
-            client = HTTPClient(url.rsplit('/api/chat', 1)[0])
-
             data = {
                 "model": model,
                 "messages": [
@@ -254,17 +286,16 @@ def correct_words_ollama(text: str, url: str = "http://localhost:11434/api/chat"
                 "stream": False
             }
 
-            json_data = client.post("/api/chat", data)
+            content = _chat(url, data)
 
             # 檢查回應格式
-            if "message" not in json_data or "content" not in json_data["message"]:
+            if content is None:
                 raise TranslationError(
                     message="API 回應格式錯誤",
                     error_code=ErrorCode.API_RESPONSE_ERROR,
-                    details={"response": json_data}
                 )
 
-            correct_text = json_data["message"]["content"].strip()
+            correct_text = content.strip()
 
             if not correct_text:
                 logger.warning("API 回傳空的修正結果，使用原始文字")
@@ -284,14 +315,78 @@ def correct_words_ollama(text: str, url: str = "http://localhost:11434/api/chat"
         )
 
 
+# 補標點提示詞（實驗結果：gemma-4-26B-A4B 補標點效果佳，且不會降低 CER）
+PUNCTUATE_PROMPT = (
+    "請將以下無標點的 ASR 轉錄文字補上適當的全形中文標點符號，並修正同音錯字，"
+    "保持原意不變。只輸出修正後的文字，不要任何說明。reply in zh-TW"
+)
+
+
 @retry_on_exception(max_retries=3, delay=1.0, exceptions=(APIError,))
-def correct_words_ollama_fail(text: str, url: str = "http://localhost:11434/api/chat", model: str = "gemma3:27b") -> str:
+def punctuate_text(text: str, url: str = LLM_BASE_URL, model: str = LLM_MODEL) -> str:
+    """
+    為無標點的 ASR 轉錄文字補上全形標點，並修正同音錯字
+
+    Args:
+        text: ASR 轉錄文字
+        url: LLM 服務網址（OpenAI 相容 API）
+        model: 使用的模型名稱
+
+    Returns:
+        補上標點後的文字；LLM 回傳空字串時回傳原文
+
+    Raises:
+        TranslationError: 當處理失敗時
+        APIError: 當 API 呼叫失敗時
+    """
+    if not text or not text.strip():
+        return text  # 空文字直接回傳
+
+    try:
+        with error_context("text_punctuation", text_length=len(text), model=model):
+            data = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": PUNCTUATE_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                "temperature": 0,  # 結果可重現，降低改寫風險
+            }
+            content = _chat(url, data)
+
+            if content is None:
+                raise TranslationError(
+                    message="API 回應格式錯誤",
+                    error_code=ErrorCode.API_RESPONSE_ERROR,
+                )
+
+            result = content.strip()
+            if not result:
+                logger.warning("API 回傳空的補標點結果，使用原始文字")
+                return text
+
+            # 不做 s2twp：輸入已是繁體且提示詞要求 zh-TW，再轉換反而誤改詞彙（如「參數」→「引數」）
+            return result
+
+    except APIError:
+        raise  # 重新拋出 API 錯誤，讓重試機制處理
+    except Exception as e:
+        raise TranslationError(
+            message=f"補標點失敗: {str(e)}",
+            error_code=ErrorCode.TRANSLATION_ERROR,
+            details={"text_length": len(text), "model": model},
+            original_exception=e
+        )
+
+
+@retry_on_exception(max_retries=3, delay=1.0, exceptions=(APIError,))
+def correct_words_ollama_fail(text: str, url: str = LLM_BASE_URL, model: str = LLM_MODEL) -> str:
     """
     修正錯字（備用版本）
     
     Args:
         text: 要修正的文字
-        url: Ollama API URL
+        url: LLM 服務網址（OpenAI 相容 API）
         model: 使用的模型名稱
         
     Returns:
@@ -306,8 +401,6 @@ def correct_words_ollama_fail(text: str, url: str = "http://localhost:11434/api/
 
     try:
         with error_context("text_correction_fail", text_length=len(text), model=model):
-            client = HTTPClient(url.rsplit('/api/chat', 1)[0])
-
             data = {
                 "model": model,
                 "messages": [
@@ -341,17 +434,16 @@ Follow these rules STRICTLY:
             }
 
             # 發送 POST 請求
-            json_data = client.post("/api/chat", data)
+            content = _chat(url, data)
 
             # 檢查回應格式
-            if "message" not in json_data or "content" not in json_data["message"]:
+            if content is None:
                 raise TranslationError(
                     message="API 回應格式錯誤",
                     error_code=ErrorCode.API_RESPONSE_ERROR,
-                    details={"response": json_data}
                 )
 
-            correct_text = json_data["message"]["content"].strip()
+            correct_text = content.strip()
             
             if not correct_text:
                 logger.warning("API 回傳空的修正結果，使用原始文字")
@@ -372,7 +464,7 @@ Follow these rules STRICTLY:
 
 
 @retry_on_exception(max_retries=3, delay=1.0, exceptions=(APIError,))
-def translate_text_ollama(text: str, target_language: str = "zh-TW", model: str = "gemma3:27b") -> str:
+def translate_text_ollama(text: str, target_language: str = "zh-TW", model: str = LLM_MODEL) -> str:
     """
     翻譯文字
 
@@ -402,9 +494,6 @@ def translate_text_ollama(text: str, target_language: str = "zh-TW", model: str 
 
     try:
         with error_context("text_translation", text_length=len(text), target_language=target_language, model=model):
-            url = "http://localhost:11434/api/chat"
-            client = HTTPClient(url.rsplit('/api/chat', 1)[0])
-
             data = {
                 "model": model,
                 "messages": [
@@ -421,17 +510,16 @@ def translate_text_ollama(text: str, target_language: str = "zh-TW", model: str 
             }
 
             # 發送 POST 請求以獲取翻譯
-            json_data = client.post("/api/chat", data)
+            content = _chat(LLM_BASE_URL, data)
 
             # 檢查回應格式
-            if "message" not in json_data or "content" not in json_data["message"]:
+            if content is None:
                 raise TranslationError(
                     message="API 回應格式錯誤",
                     error_code=ErrorCode.API_RESPONSE_ERROR,
-                    details={"response": json_data}
                 )
 
-            translate_text = json_data["message"]["content"].strip()
+            translate_text = content.strip()
 
             if not translate_text:
                 logger.warning("API 回傳空的翻譯結果，使用原始文字")
@@ -441,7 +529,7 @@ def translate_text_ollama(text: str, target_language: str = "zh-TW", model: str 
             if target_language == "zh-TW":
                 try:
                     cc = OpenCC("s2twp")  # 翻成台灣繁體中文，避免大語言模型誤寫簡體中文
-                    translate_text = cc.convert(translate_text)
+                    translate_text = fix_s2twp(cc.convert(translate_text))
                 except Exception as e:
                     logger.warning(f"繁體中文轉換失敗: {str(e)}")
                     # 轉換失敗不影響主要功能，繼續執行

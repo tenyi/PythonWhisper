@@ -55,11 +55,11 @@ def main():
                 logger.warning("逐字稿內容為空")
                 return
             
-            url = "http://10.10.10.201:11434/api/chat"
+            # LLM 服務與模型由環境變數 LLM_BASE_URL / LLM_MODEL 設定（見 translator_ollama.py）
             
             # 修正錯字
             logger.info("開始修正錯字")
-            corrected_text = correct_words_ollama(text, url)
+            corrected_text = correct_words_ollama(text)
             
             # 寫入修正後的文字
             write_output_file(output_file, corrected_text)
@@ -67,7 +67,7 @@ def main():
             
             # 可選：產生摘要
             # logger.info("開始產生摘要")
-            # summary = summary_text_ollama(text, url)
+            # summary = summary_text_ollama(text)
             # write_output_file("summary.txt", summary)
             # logger.info("摘要已產生")
             

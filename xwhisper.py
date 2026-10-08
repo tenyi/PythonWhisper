@@ -6,7 +6,7 @@ import logging
 from pydantic import BaseModel
 import sys  # 匯入 sys 模組，用於處理命令列參數
 from typing import List, Optional  # 匯入類型提示
-from translator_ollama import translate_text_ollama, summary_text_ollama
+from translator_ollama import translate_text_ollama, summary_text_ollama, fix_s2twp
 import uuid
 
 # 匯入共用模組
@@ -160,7 +160,7 @@ def write_transcript(
                 segment_text: str = segment.text
                 if info.language == "zh" and cc:  # 再次判斷語言是否為中文
                     # 如果是中文，則將片段文字轉換為繁體中文
-                    segment_text = cc.convert(segment.text)
+                    segment_text = fix_s2twp(cc.convert(segment.text))  # 修正 s2twp 誤轉（如「只要」→「隻要」）
                 # 將格式化後的時間戳記和文字寫入檔案
                 f.write(
                     "[%s --> %s]\n %s\n\n"  # 時間戳記格式，並空一行
