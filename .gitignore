@@ -1,0 +1,22 @@
+# 虛擬環境
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 日誌與暫存
+logs/
+*.log
+*.tmp
+
+# 模型權重（Hugging Face 下載的大型檔案，請透過 hf download 重新取得）
+models/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 系統
+.DS_Store
+Thumbs.db

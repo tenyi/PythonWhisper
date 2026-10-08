@@ -10,13 +10,19 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "flask>=3.1.2",
     "gunicorn>=23.0.0",
-    "openai-whisper>=20250625",
     "opencc>=1.1.9",
+    "opencc-python-reimplemented>=0.1.7",
+    "openai-whisper>=20250625",
     "pip>=25.3",
     "pydantic>=2.12.4",
     "python-dotenv>=1.2.1",
     "torch>=2.9.1",
     "torchaudio>=2.9.1",
-    "torchcodec>=0.8.1",
     "torchvision>=0.24.1",
+    # Breeze-ASR-26 (MediaTek-Research/Breeze-ASR-26) 使用的依賴
+    "transformers>=5.0",
+    "accelerate>=1.0",
+    "av>=12.0",                # PyAV — 音訊載入用，避免 torchcodec 對 FFmpeg 版本的耦合
+    "tokenizers>=0.23.1,<0.24.0",
+    "huggingface-hub>=0.34.0",
 ]

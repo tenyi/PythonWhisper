@@ -1,5 +1,9 @@
 pytest>=7.0.0
 requests>=2.25.0
-opencc-python-reimplemented>=1.1.0
 waitress
-openai-whisper>=20240930
+# Breeze-ASR-26 (MediaTek-Research/Breeze-ASR-26) 使用的依賴
+transformers>=5.0
+accelerate>=1.0
+av>=12.0
+tokenizers>=0.23.1,<0.24.0
+huggingface-hub>=0.34.0
