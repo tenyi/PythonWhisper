@@ -1,0 +1,5 @@
+pytest>=7.0.0
+requests>=2.25.0
+opencc-python-reimplemented>=1.1.0
+waitress
+openai-whisper>=20240930
