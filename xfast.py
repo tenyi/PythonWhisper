@@ -796,7 +796,7 @@ def write_translation(segments_list, info, filename):
     try:
         with error_context("write_translation", filename=filename):
             # 原本為「中翻中」翻譯，LLM 會改寫內容；改為補標點＋修正同音錯字（punctuate_text）。
-            # 不再做 OpenCC 轉換：punctuate_text 已對 LLM 輸出做過繁體轉換，重複轉換會誤轉
+            # 不做 OpenCC 轉換：輸入已是繁體且提示詞要求 zh-TW，再套 s2twp 會誤轉（如「參數」→「引數」）
             with open(filename, "w", encoding="utf-8") as f:
                 for segment in segments_list:
                     text = segment.text
