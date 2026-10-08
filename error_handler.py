@@ -11,6 +11,12 @@ from functools import wraps
 # 設定日誌
 logger = logging.getLogger(__name__)
 
+# 匯入 HTTPClient 作為向後相容導出
+try:
+    from http_client import HTTPClient
+except ImportError:
+    HTTPClient = None
+
 
 class WhisperError(Exception):
     """Whisper 相關錯誤的基礎異常類別"""

@@ -13,6 +13,7 @@ initialize_model / release_model / write_*）與原本 OpenAI-Whisper 版本
 """
 import gc
 import os
+import re
 import sys
 import threading
 import uuid
@@ -30,7 +31,6 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 from common import (
     Segment,
     TranscriptionInfo,
-    FileHandler,
     opencc_manager,
     safe_execute,
     handle_errors,
@@ -359,9 +359,11 @@ class BreezeASREngine:
             ]
         elif mode == "alignment":
             try:
-                return self._transcribe_chunk_aligned(
+                aligned_segs = self._transcribe_chunk_aligned(
                     chunk_wav, language, offset, pred_ids, chunk_duration
                 )
+                if aligned_segs:
+                    return aligned_segs
             except Exception as e:
                 logger.warning(f"Cross-attention alignment 失敗，退用 chars: {e}")
                 # 繼續用 chars 模式
@@ -384,59 +386,69 @@ class BreezeASREngine:
         """按字元數切段，時間均分。
 
         規則：
-        - 優先在空白處切（避免拆開詞）
-        - 切完的每段字元數 <= max_chars
+        - 支援中文與台語漢字無空白連續文字切段
+        - 英文與羅馬拼音按單詞切段並保留原空白
+        - 標點符號優先作為自然斷句點
+        - 切完每段字元數 <= max_chars（單詞超過者獨立成段）
         - 最後一段可短於 min_chars（保留尾部）
         """
-        if not text.strip():
+        if not text or not text.strip():
             return []
 
-        # 先用空白 + 中文標點切，但不要切太碎
-        # 簡化：按空白切 token
-        words = text.split()
-        if not words:
+        # Tokenize：區分 CJK 單字元、一般文字+空格、空白符
+        pattern = (
+            r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3000-\u303f\uff00-\uffef]'
+            r'|[^\s\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3000-\u303f\uff00-\uffef]+(?:\s*)'
+            r'|\s+'
+        )
+        tokens = re.findall(pattern, text)
+        if not tokens:
             return []
 
-        segments: List[Segment] = []
-        current_words: List[str] = []
-        current_chars = 0
+        punct_set = set("，。！？、；：,!?.…")
+        raw_segments: List[str] = []
+        current_tokens: List[str] = []
 
-        def flush(force: bool = False):
-            nonlocal current_words, current_chars
-            if not current_words:
-                return
-            txt = "".join(current_words).strip()  # 保留原空白
-            if not txt:
-                current_words = []
-                current_chars = 0
-                return
-            current_words = []
-            current_chars = 0
-            # 加入一個 placeholder，呼叫端再算時間
-            segments.append(("__pending__", txt))
+        def cur_len() -> int:
+            return len("".join(current_tokens).strip())
 
-        for w in words:
-            wlen = len(w)
-            if current_chars + wlen > max_chars and current_chars >= min_chars:
-                flush()
-            current_words.append(w)
-            current_chars += wlen
-        flush()
+        for tok in tokens:
+            # 若前一個 token 結尾為標點符號，且已達最短長度，優先切段
+            if current_tokens and cur_len() >= min_chars:
+                last_char = "".join(current_tokens).rstrip()[-1:]
+                if last_char in punct_set:
+                    raw_segments.append("".join(current_tokens).strip())
+                    current_tokens = []
+
+            tok_len = len(tok.strip())
+            if tok_len > 0 and cur_len() + tok_len > max_chars and cur_len() >= min_chars:
+                raw_segments.append("".join(current_tokens).strip())
+                current_tokens = []
+
+            current_tokens.append(tok)
+
+        if current_tokens:
+            txt = "".join(current_tokens).strip()
+            if txt:
+                raw_segments.append(txt)
+
+        if not raw_segments:
+            return []
 
         # 計算每段時間（按字元比例）
-        total_chars = sum(len(s[1]) for s in segments)
+        total_chars = sum(len(s) for s in raw_segments)
         if total_chars == 0:
             return []
 
         result: List[Segment] = []
         cursor = offset
         end_boundary = offset + chunk_duration
-        for i, (_, txt) in enumerate(segments):
+        for i, txt in enumerate(raw_segments):
             portion = len(txt) / total_chars
             seg_dur = chunk_duration * portion
             seg_start = cursor
             seg_end = seg_start + seg_dur
-            if i == len(segments) - 1:
+            if i == len(raw_segments) - 1:
                 # 最後一段對齊 chunk 結尾
                 seg_end = end_boundary
             result.append(
@@ -458,6 +470,9 @@ class BreezeASREngine:
         """
         assert self.model is not None and self.processor is not None
 
+        if chunk_duration is None:
+            chunk_duration = len(chunk_wav) / TARGET_SR
+
         if pred_ids is None:
             inputs = self.processor.feature_extractor(
                 chunk_wav, sampling_rate=TARGET_SR, return_tensors="pt"
@@ -470,7 +485,8 @@ class BreezeASREngine:
                     language=language,
                     task="transcribe",
                 )[0]
-            chunk_duration = len(chunk_wav) / TARGET_SR
+        elif hasattr(pred_ids, "ndim") and pred_ids.ndim == 2:
+            pred_ids = pred_ids[0]
 
         if len(pred_ids) <= 4:
             return []
@@ -490,7 +506,7 @@ class BreezeASREngine:
 
         cross_attentions = outputs.cross_attentions
         if cross_attentions is None or len(cross_attentions) == 0:
-            raise RuntimeError("no cross_attentions")
+            return []
 
         n_layers = len(cross_attentions)
         align_layer = int(os.environ.get("BREEZE_ALIGN_LAYER", "16"))
@@ -504,12 +520,13 @@ class BreezeASREngine:
             alignment = cross_attentions[align_layer][0].mean(dim=0)
 
         # weighted mean
-        frame_indices = (alignment * torch.arange(1500, device=self.device).unsqueeze(0).float()).sum(dim=-1) / alignment.sum(dim=-1)
+        n_frames = alignment.shape[-1]
+        frame_indices = (alignment * torch.arange(n_frames, device=self.device).unsqueeze(0).float()).sum(dim=-1) / (alignment.sum(dim=-1) + 1e-8)
         token_times = frame_indices * 0.02 + offset
 
         special_ids = set(self.processor.tokenizer.all_special_ids)
         text_indices = [
-            i for i in range(3, len(pred_ids))
+            i for i in range(len(pred_ids))
             if pred_ids[i].item() not in special_ids
         ]
         if not text_indices:
@@ -519,7 +536,50 @@ class BreezeASREngine:
             self.processor.tokenizer.decode([pred_ids[i].item()], skip_special_tokens=True)
             for i in text_indices
         ]
-        text_times_list = [token_times[i].item() for i in text_indices]
+        token_times_list = [
+            max(offset, min(offset + chunk_duration, token_times[i].item()))
+            for i in text_indices
+        ]
+
+        # 依時間間隔與長度將 token 組織為 Segment
+        gap_threshold = float(os.environ.get("BREEZE_ALIGN_GAP_MS", "500")) / 1000.0
+        aligned_segments: List[Segment] = []
+        cur_tokens: List[str] = []
+        cur_start = token_times_list[0]
+        cur_end = token_times_list[0]
+
+        for tok, t_time in zip(text_tokens, token_times_list):
+            if not tok:
+                continue
+            if cur_tokens and (t_time - cur_end > gap_threshold or len("".join(cur_tokens)) >= 15):
+                txt = "".join(cur_tokens).strip()
+                if txt:
+                    aligned_segments.append(
+                        Segment(
+                            start=round(cur_start, 3),
+                            end=round(max(cur_end, cur_start + 0.1), 3),
+                            text=txt,
+                        )
+                    )
+                cur_tokens = [tok]
+                cur_start = t_time
+                cur_end = t_time
+            else:
+                cur_tokens.append(tok)
+                cur_end = max(cur_end, t_time)
+
+        if cur_tokens:
+            txt = "".join(cur_tokens).strip()
+            if txt:
+                aligned_segments.append(
+                    Segment(
+                        start=round(cur_start, 3),
+                        end=round(max(cur_end, offset + chunk_duration), 3),
+                        text=txt,
+                    )
+                )
+
+        return aligned_segments
 
 
 
@@ -591,7 +651,6 @@ def release_model() -> None:
         try:
             with error_context("breeze_asr_release"):
                 logger.info("正在釋放 Breeze-ASR-26 模型...")
-                del asr_engine
                 asr_engine = None
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -691,8 +750,12 @@ def write_translation(segments_list, info, filename):
                     text = segment.text
                     if not text.strip():
                         continue
-                    translated = translate_text_ollama(text)
-                    if cc is not None:
+                    translated = safe_execute(
+                        translate_text_ollama,
+                        text,
+                        fallback_value=text,
+                    )
+                    if cc is not None and translated:
                         translated = cc.convert(translated)
                     f.write(
                         "[%s --> %s]\n %s\n\n"
@@ -705,8 +768,8 @@ def write_translation(segments_list, info, filename):
             with open(filename, "r", encoding="utf-8") as f:
                 return f.read()
     except Exception as e:
-        logger.error(f"翻譯逐字稿失敗: {filename} - {str(e)}")
-        raise
+        logger.warning(f"翻譯逐字稿寫入失敗，略過翻譯檔案產製: {filename} - {str(e)}")
+        return ""
 
 
 def get_openai_json_text(segments, info):

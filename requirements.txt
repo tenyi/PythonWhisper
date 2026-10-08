@@ -1,6 +1,14 @@
 pytest>=7.0.0
 requests>=2.25.0
 waitress
+flask>=3.1.2
+gunicorn>=23.0.0
+pydantic>=2.12.4
+python-dotenv>=1.2.1
+opencc>=1.1.9
+opencc-python-reimplemented>=0.1.7
+torch>=2.0.0
+torchaudio>=2.0.0
 # Breeze-ASR-26 (MediaTek-Research/Breeze-ASR-26) 使用的依賴
 transformers>=5.0
 accelerate>=1.0
