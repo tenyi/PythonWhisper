@@ -187,6 +187,202 @@ models/Breeze-ASR-26/
 
 ---
 
+## 模型檔案位置總覽
+
+| 模型 | 路徑 | 大小 | 說明 |
+| --- | --- | --- | --- |
+| Breeze-ASR-26 | `./models/Breeze-ASR-26/` | **5.8 GB** | 透過 `hf download` 下載 |
+| Silero VAD | `~/.cache/torch/hub/snakers4_silero-vad_master/` | 36 MB | 透過 `torch.hub.load` 自動下載（會快取整個 git repo） |
+| Silero VAD 精簡 | `~/.cache/torch/hub/snakers4_silero-vad_master/src/silero_vad/data/` | 14 MB | 實際推論用到的權重 |
+
+### VAD 權重細節
+
+`src/silero_vad/data/` 目錄內有多種格式的權重，推論時會根據 `onnx` 參數自動選擇：
+
+| 檔案 | 大小 | 用途 |
+| --- | --- | --- |
+| `silero_vad.jit` | 2.3 MB | PyTorch JIT（`onnx=False`，預設使用） |
+| `silero_vad.onnx` | 2.3 MB | ONNX（`onnx=True`） |
+| `silero_vad_half.onnx` | 1.3 MB | ONNX fp16 |
+| `silero_vad_16k.safetensors` | 1.2 MB | safetensors 格式（PyTorch 載入） |
+| `silero_vad_16k_op15.onnx` | 1.3 MB | ONNX opset 15 |
+| `silero_vad_16k_op18_ifless.onnx` | 2.8 MB | ONNX opset 18 (if-less) |
+| `silero_vad_16k_sequence.onnx` | 1.2 MB | 序列式 ONNX |
+| `silero_vad_openvino_16k.onnx` | 1.3 MB | OpenVINO IR |
+
+我們用 PyTorch 版本（`silero_vad.jit` 或 `.safetensors`），其餘是給 ONNX / OpenVINO runtime 用的。
+
+---
+
+## 部署到離線伺服器
+
+> 適用情境：開發機有網路，生產 server 無法連外（air-gapped）。
+
+### 1. 複製模型（在線機器執行）
+
+#### 方案 A：完整複製（最簡單，推薦）
+
+```bash
+# 在線機器打包
+cd /home/tenyi
+tar -czf breeze-asr-models.tar.gz \
+  PythonWhisper/models/Breeze-ASR-26 \
+  .cache/torch/hub/snakers4_silero-vad_master
+
+# 傳到目標 server（用 scp / rsync / USB 等）
+scp breeze-asr-models.tar.gz <user>@<server>:/tmp/
+
+# 目標 server 解開（保持原來的相對路徑）
+ssh <user>@<server>
+mkdir -p ~/PythonWhisper/models
+tar -xzf /tmp/breeze-asr-models.tar.gz -C /home/<user>/
+```
+
+#### 方案 B：精簡 VAD（只複製推論需要的權重，36 MB → ~3 MB）
+
+```bash
+# 在線機器
+cd ~/.cache/torch/hub
+tar -czf silero-vad-minimal.tar.gz \
+  snakers4_silero-vad_master/src \
+  snakers4_silero-vad_master/hubconf.py \
+  snakers4_silero-vad_master/pyproject.toml \
+  snakers4_silero-vad_master/LICENSE
+
+# 目標 server
+mkdir -p ~/.cache/torch/hub/snakers4_silero-vad_master
+tar -xzf silero-vad-minimal.tar.gz -C ~/.cache/torch/hub/snakers4_silero-vad_master/
+```
+
+### 2. 複製 Python 環境（最重要！）
+
+模型只是冰山一角，整個 Python venv 才是最大：
+
+```bash
+# 在線機器（保留所有依賴：transformers, accelerate, av, torch, ...）
+rsync -avz --exclude='__pycache__' \
+  /home/tenyi/PythonWhisper/.venv/ \
+  <server>:/home/<user>/PythonWhisper/.venv/
+```
+
+### 3. 複製程式碼
+
+```bash
+# 排除 .venv 與 models/（都已另外處理）
+rsync -avz \
+  --exclude='.venv' \
+  --exclude='models/' \
+  --exclude='__pycache__' \
+  --exclude='*.log' \
+  --exclude='logs/' \
+  /home/tenyi/PythonWhisper/ \
+  <server>:/home/<user>/PythonWhisper/
+```
+
+### 4. 安裝系統依賴
+
+目標 server 還需要 FFmpeg（PyAV 動態呼叫）：
+
+```bash
+# Debian / Ubuntu
+sudo apt-get update && sudo apt-get install -y ffmpeg
+
+# RHEL / CentOS
+sudo yum install -y ffmpeg
+
+# macOS
+brew install ffmpeg
+```
+
+驗證：
+```bash
+ffmpeg -version | head -1
+python -c "import av; print('PyAV OK', av.__version__)"
+```
+
+### 5. 設定離線環境變數
+
+防止程式啟動時嘗試連外下載任何東西：
+
+```bash
+# 寫到 ~/.bashrc 或 server.sh 開頭
+export HF_HUB_OFFLINE=1              # 阻止 huggingface_hub 連線
+export TRANSFORMERS_OFFLINE=1        # 阻止 transformers 連線
+export BREEZE_ASR_MODEL_PATH=./models/Breeze-ASR-26
+```
+
+`uv` 環境管理也需要鎖定（不要再試圖升級套件）：
+```bash
+# server.sh 開頭加
+export UV_OFFLINE=1
+```
+
+### 6. 啟動驗證
+
+```bash
+# 啟動
+cd ~/PythonWhisper
+./server.sh
+
+# 健康檢查
+curl http://localhost:22434/health
+# {"service":"whisper-api","status":"healthy"}
+
+# 帶音訊測試（用本地檔案）
+curl -X POST -F "file=@test.ogg" http://localhost:22434/transcribe
+```
+
+### 7. 檢查 log 確認沒嘗試連網
+
+啟動時應該看到：
+
+```
+✓ Using cache found in /home/<user>/.cache/torch/hub/snakers4_silero-vad_master
+✓ Breeze-ASR-26 模型載入完成
+✓ 🚀 使用 CUDA GPU: <GPU 型號>
+```
+
+**絕對不該**看到的訊息：
+- ❌ `Downloading: "https://github.com/..."`
+- ❌ `HF_TOKEN` 相關
+- ❌ `Connection refused` / `Timeout`
+- ❌ `Could not download`
+
+如果出現，模型沒放對位置或環境變數沒設。
+
+### 8. 完整搬遷清單
+
+打包時建議的檔案清單（依賴體積）：
+
+| 項目 | 位置 | 大小 | 必要 |
+| --- | --- | --- | --- |
+| Breeze-ASR-26 權重 | `models/Breeze-ASR-26/` | 5.8 GB | ✅ |
+| Silero VAD 完整 repo | `~/.cache/torch/hub/snakers4_silero-vad_master/` | 36 MB | ✅ |
+| Python venv | `.venv/` | ~6-8 GB | ✅ |
+| 程式碼 | `xfast.py`, `xflask-whisper.py` 等 | < 1 MB | ✅ |
+| FFmpeg 系統套件 | `apt install ffmpeg` | ~50 MB | ✅ |
+| GPU driver + CUDA | （系統已裝） | — | ✅ |
+
+**總計約 12-14 GB**（含 Python venv）。
+
+### 9. 用 rsync 增量同步（適合日後更新）
+
+```bash
+# 之後有新版本時，只同步變更的檔案
+rsync -avzu --exclude='.venv' --exclude='models/' --exclude='__pycache__' \
+  /home/tenyi/PythonWhisper/ \
+  <server>:/home/<user>/PythonWhisper/
+
+# 同步單一模型權重（單獨處理大檔）
+rsync -avz --progress \
+  /home/tenyi/PythonWhisper/models/ \
+  <server>:/home/<user>/PythonWhisper/models/
+```
+
+`-u` 只同步較新的檔案；`--progress` 顯示進度。
+
+---
+
 ## 啟動服務
 
 ### 使用 `server.sh`
